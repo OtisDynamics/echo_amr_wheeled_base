@@ -1,0 +1,477 @@
+#include <Arduino.h>
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+
+#define ESPSerial Serial1
+#define HoverSerial Serial2
+
+constexpr uint32_t ESP_BAUD = 115200;
+constexpr uint32_t HOVER_BAUD = 115200;
+constexpr uint32_t USB_BAUD = 115200;
+
+constexpr uint16_t START_FRAME = 0xABCD;
+
+constexpr uint32_t COMMAND_PERIOD_MS = 20;
+constexpr uint32_t RAMP_PERIOD_MS = 20;
+constexpr uint32_t ODOM_PERIOD_MS = 40;
+constexpr uint32_t ESP_TIMEOUT_MS = 200;
+
+constexpr bool DEBUG_SERIAL = false;
+
+// Motor speed settings
+constexpr float MAX_RPM = 150.0f;
+constexpr float DRIVE_RPM = 10.0f;
+constexpr float TURN_RPM = 5.0f;
+
+constexpr float RAMP_RPM_PER_STEP = 0.25f;
+constexpr float JOYSTICK_DEADZONE = 8.0f;
+
+constexpr int JOYSTICK_X_SIGN = +1;
+constexpr int JOYSTICK_Y_SIGN = +1;
+
+// Robot geometry
+constexpr float LEFT_WHEEL_DIAMETER_M = 0.1651f;
+constexpr float RIGHT_WHEEL_DIAMETER_M = 0.1651f;
+
+// Calibration values, verify before navigation
+constexpr float LEFT_TICKS_PER_REV = 90.0f;
+constexpr float RIGHT_TICKS_PER_REV = 90.0f;
+constexpr float TRACK_WIDTH_M = 0.500f;
+
+// Motor and encoder directions
+constexpr int LEFT_CMD_SIGN = +1;
+constexpr int RIGHT_CMD_SIGN = +1;
+constexpr int LEFT_ODOM_SIGN = +1;
+constexpr int RIGHT_ODOM_SIGN = +1;
+
+// Hoverboard serial packets
+struct __attribute__((packed)) SerialCommand {
+  uint16_t start;
+  int16_t left, right;
+  uint16_t checksum;
+};
+
+struct __attribute__((packed)) SerialFeedback {
+  uint16_t start;
+  int16_t cmd1, cmd2;
+  int16_t speedR_meas, speedL_meas;
+  int16_t wheelR_cnt, wheelL_cnt;
+  int16_t batVoltage, boardTemp;
+  uint16_t cmdLed, checksum;
+};
+
+static_assert(sizeof(SerialCommand) == 8,
+              "Command packet size mismatch");
+static_assert(sizeof(SerialFeedback) == 22,
+              "Feedback packet size mismatch");
+
+SerialCommand command = {};
+SerialFeedback feedback = {}, newFeedback = {};
+
+uint8_t feedbackBuffer[sizeof(SerialFeedback)] = {};
+size_t feedbackIndex = 0;
+uint32_t validFeedbackPackets = 0;
+
+// Joystick
+int joystickX = 0, joystickY = 0;
+uint32_t lastESPMessageTime = 0;
+bool espConnected = false;
+
+char espBuffer[40] = {};
+size_t espBufferIndex = 0;
+
+// Motor targets
+float targetLeftRPM = 0, targetRightRPM = 0;
+float currentLeftRPM = 0, currentRightRPM = 0;
+
+// Odometry
+int16_t previousLeftRaw = 0;
+int16_t previousRightRaw = 0;
+bool odometryInitialized = false;
+
+int32_t totalLeftTicks = 0;
+int32_t totalRightTicks = 0;
+
+float leftDistanceM = 0, rightDistanceM = 0;
+float robotX = 0, robotY = 0, robotTheta = 0;
+
+// Timing
+uint32_t lastCommandTime = 0;
+uint32_t lastRampTime = 0;
+uint32_t lastOdomTime = 0;
+
+// ============================================================
+// MOTOR CONTROL
+// ============================================================
+
+void setWheelRPM(float leftRPM, float rightRPM) {
+  targetLeftRPM = constrain(leftRPM, -MAX_RPM, MAX_RPM);
+  targetRightRPM = constrain(rightRPM, -MAX_RPM, MAX_RPM);
+}
+
+void stopWheels() {
+  setWheelRPM(0, 0);
+  currentLeftRPM = 0;
+  currentRightRPM = 0;
+}
+
+float approachRPM(float current, float target) {
+  if (current < target) {
+    return fminf(current + RAMP_RPM_PER_STEP, target);
+  }
+  if (current > target) {
+    return fmaxf(current - RAMP_RPM_PER_STEP, target);
+  }
+  return current;
+}
+
+void updateRamping() {
+  uint32_t now = millis();
+  if (now - lastRampTime < RAMP_PERIOD_MS) return;
+
+  lastRampTime = now;
+
+  currentLeftRPM = approachRPM(currentLeftRPM, targetLeftRPM);
+  currentRightRPM = approachRPM(currentRightRPM, targetRightRPM);
+}
+
+int16_t rpmToCommand(float rpm) {
+  rpm = constrain(rpm, -MAX_RPM, MAX_RPM);
+  return (int16_t)roundf((rpm / MAX_RPM) * 1000.0f);
+}
+
+void sendWheelCommand() {
+  command.start = START_FRAME;
+  command.left = rpmToCommand(currentLeftRPM) * LEFT_CMD_SIGN;
+  command.right = rpmToCommand(currentRightRPM) * RIGHT_CMD_SIGN;
+
+  command.checksum =
+      command.start ^
+      (uint16_t)command.left ^
+      (uint16_t)command.right;
+
+  HoverSerial.write(
+      (const uint8_t *)&command,
+      sizeof(command)
+  );
+}
+
+// ============================================================
+// JOYSTICK CONTROL
+// ============================================================
+
+float applyDeadzone(float value) {
+  value = constrain(value, -100.0f, 100.0f);
+  float magnitude = fabsf(value);
+
+  if (magnitude <= JOYSTICK_DEADZONE) return 0;
+
+  float scaled =
+      (magnitude - JOYSTICK_DEADZONE) /
+      (100.0f - JOYSTICK_DEADZONE);
+
+  return value < 0 ? -scaled : scaled;
+}
+
+void applyJoystick(int x, int y) {
+  float forward =
+      applyDeadzone(y * JOYSTICK_Y_SIGN) * DRIVE_RPM;
+
+  float turn =
+      applyDeadzone(x * JOYSTICK_X_SIGN) * TURN_RPM;
+
+  float leftRPM = forward + turn;
+  float rightRPM = forward - turn;
+
+  float largest = fmaxf(fabsf(leftRPM), fabsf(rightRPM));
+
+  if (largest > DRIVE_RPM) {
+    float scale = DRIVE_RPM / largest;
+    leftRPM *= scale;
+    rightRPM *= scale;
+  }
+
+  setWheelRPM(leftRPM, rightRPM);
+}
+
+// ============================================================
+// ESP32 COMMUNICATION
+// ============================================================
+
+void processESPMessage(const char *message) {
+  int x, y, consumed = 0;
+
+  if (sscanf(message, "X:%d,Y:%d%n", &x, &y, &consumed) != 2)
+    return;
+
+  if (message[consumed] != '\0') return;
+
+  if (x < -100 || x > 100 || y < -100 || y > 100)
+    return;
+
+  joystickX = x;
+  joystickY = y;
+
+  lastESPMessageTime = millis();
+  espConnected = true;
+
+  applyJoystick(x, y);
+}
+
+void readESPSerial() {
+  while (ESPSerial.available()) {
+    char c = (char)ESPSerial.read();
+
+    if (c == '\n') {
+      espBuffer[espBufferIndex] = '\0';
+      processESPMessage(espBuffer);
+      espBufferIndex = 0;
+    }
+    else if (c != '\r') {
+      if (espBufferIndex < sizeof(espBuffer) - 1) {
+        espBuffer[espBufferIndex++] = c;
+      }
+      else {
+        espBufferIndex = 0;
+      }
+    }
+  }
+}
+
+void checkESPTimeout() {
+  if (!espConnected ||
+      millis() - lastESPMessageTime > ESP_TIMEOUT_MS) {
+
+    espConnected = false;
+    joystickX = 0;
+    joystickY = 0;
+    stopWheels();
+  }
+}
+
+// ============================================================
+// HOVERBOARD FEEDBACK
+// ============================================================
+
+bool validFeedback(const SerialFeedback &f) {
+  uint16_t checksum =
+      f.start ^
+      (uint16_t)f.cmd1 ^
+      (uint16_t)f.cmd2 ^
+      (uint16_t)f.speedR_meas ^
+      (uint16_t)f.speedL_meas ^
+      (uint16_t)f.wheelR_cnt ^
+      (uint16_t)f.wheelL_cnt ^
+      (uint16_t)f.batVoltage ^
+      (uint16_t)f.boardTemp ^
+      f.cmdLed;
+
+  return f.start == START_FRAME && checksum == f.checksum;
+}
+
+// ============================================================
+// ODOMETRY CALCULATIONS
+// ============================================================
+
+void updateOdometry(int16_t newLeftRaw, int16_t newRightRaw) {
+  if (!odometryInitialized) {
+    previousLeftRaw = newLeftRaw;
+    previousRightRaw = newRightRaw;
+    odometryInitialized = true;
+    return;
+  }
+
+  int16_t deltaLeftRaw =
+      (int16_t)((uint16_t)newLeftRaw -
+                (uint16_t)previousLeftRaw);
+
+  int16_t deltaRightRaw =
+      (int16_t)((uint16_t)newRightRaw -
+                (uint16_t)previousRightRaw);
+
+  previousLeftRaw = newLeftRaw;
+  previousRightRaw = newRightRaw;
+
+  int32_t deltaLeftTicks =
+      (int32_t)deltaLeftRaw * LEFT_ODOM_SIGN;
+
+  int32_t deltaRightTicks =
+      (int32_t)deltaRightRaw * RIGHT_ODOM_SIGN;
+
+  totalLeftTicks += deltaLeftTicks;
+  totalRightTicks += deltaRightTicks;
+
+  float deltaLeftM =
+      deltaLeftTicks * PI * LEFT_WHEEL_DIAMETER_M /
+      LEFT_TICKS_PER_REV;
+
+  float deltaRightM =
+      deltaRightTicks * PI * RIGHT_WHEEL_DIAMETER_M /
+      RIGHT_TICKS_PER_REV;
+
+  leftDistanceM += deltaLeftM;
+  rightDistanceM += deltaRightM;
+
+  float deltaDistance = (deltaLeftM + deltaRightM) / 2.0f;
+  float deltaTheta = (deltaRightM - deltaLeftM) / TRACK_WIDTH_M;
+
+  float thetaMid = robotTheta + deltaTheta / 2.0f;
+
+  robotX += deltaDistance * cosf(thetaMid);
+  robotY += deltaDistance * sinf(thetaMid);
+  robotTheta += deltaTheta;
+
+  while (robotTheta > PI) robotTheta -= 2.0f * PI;
+  while (robotTheta < -PI) robotTheta += 2.0f * PI;
+}
+
+void receiveFeedback() {
+  while (HoverSerial.available()) {
+    uint8_t incoming = (uint8_t)HoverSerial.read();
+
+    if (feedbackIndex == 0) {
+      if (incoming == 0xCD)
+        feedbackBuffer[feedbackIndex++] = incoming;
+      continue;
+    }
+
+    if (feedbackIndex == 1) {
+      if (incoming == 0xAB)
+        feedbackBuffer[feedbackIndex++] = incoming;
+      else if (incoming == 0xCD) {
+        feedbackBuffer[0] = incoming;
+        feedbackIndex = 1;
+      }
+      else {
+        feedbackIndex = 0;
+      }
+      continue;
+    }
+
+    feedbackBuffer[feedbackIndex++] = incoming;
+
+    if (feedbackIndex == sizeof(SerialFeedback)) {
+      memcpy(&newFeedback, feedbackBuffer, sizeof(newFeedback));
+
+      if (validFeedback(newFeedback)) {
+        feedback = newFeedback;
+        validFeedbackPackets++;
+
+        updateOdometry(
+            feedback.wheelL_cnt,
+            feedback.wheelR_cnt
+        );
+      }
+
+      feedbackIndex = 0;
+    }
+  }
+}
+
+// ============================================================
+// RESET ODOMETRY
+// ============================================================
+
+void resetOdometry() {
+  totalLeftTicks = 0;
+  totalRightTicks = 0;
+
+  leftDistanceM = 0;
+  rightDistanceM = 0;
+
+  robotX = 0;
+  robotY = 0;
+  robotTheta = 0;
+
+  previousLeftRaw = feedback.wheelL_cnt;
+  previousRightRaw = feedback.wheelR_cnt;
+
+  odometryInitialized = validFeedbackPackets > 0;
+
+  if (DEBUG_SERIAL)
+    Serial.println("ODOMETRY RESET");
+}
+
+// ============================================================
+// USB COMMANDS
+// ============================================================
+
+void readUSBCommands() {
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+
+    if (c == 's' || c == 'S')
+      stopWheels();
+
+    else if (c == 'z' || c == 'Z')
+      resetOdometry();
+  }
+}
+
+// ============================================================
+// ROS 2 ODOMETRY OUTPUT
+// ============================================================
+
+void publishOdometry() {
+  // ODOM,timestamp_ms,x_m,y_m,heading_rad,left_ticks,right_ticks
+
+  Serial.print("ODOM,");
+  Serial.print(millis());
+  Serial.print(",");
+
+  Serial.print(robotX, 6);
+  Serial.print(",");
+
+  Serial.print(robotY, 6);
+  Serial.print(",");
+
+  Serial.print(robotTheta, 6);
+  Serial.print(",");
+
+  Serial.print(totalLeftTicks);
+  Serial.print(",");
+
+  Serial.println(totalRightTicks);
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+  Serial.begin(USB_BAUD);
+  ESPSerial.begin(ESP_BAUD);
+  HoverSerial.begin(HOVER_BAUD);
+
+  stopWheels();
+
+  delay(500);
+
+  if (DEBUG_SERIAL)
+    Serial.println("TEENSY 4.1 ESP-NOW HOVERBOARD + ROS ODOMETRY");
+}
+
+// ============================================================
+// MAIN LOOP
+// ============================================================
+
+void loop() {
+  readESPSerial();
+  checkESPTimeout();
+  receiveFeedback();
+  readUSBCommands();
+  updateRamping();
+
+  uint32_t now = millis();
+
+  if (now - lastCommandTime >= COMMAND_PERIOD_MS) {
+    lastCommandTime = now;
+    sendWheelCommand();
+  }
+
+  if (now - lastOdomTime >= ODOM_PERIOD_MS) {
+    lastOdomTime = now;
+    publishOdometry();
+  }
+}
